@@ -2,69 +2,134 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
+	"regexp"
+	"strings"
 
-	"github.com/google/generative-ai-go/genai"
+	texttospeech "cloud.google.com/go/texttospeech/apiv1"
+	"cloud.google.com/go/texttospeech/apiv1/texttospeechpb"
 	"google.golang.org/api/option"
 )
 
-func main() {
-	ctx := context.Background()
+// REF: https://cloud.google.com/text-to-speech/pricing
 
-	// 1. APIキーの設定（環境変数から取得）
-	apiKey := os.Getenv("GEMINI_API_KEY")
+func main() {
+	// 1. フラグの設定
+	inputPath := flag.String("i", "input.txt", "入力ファイルのパス")
+	outputPrefix := flag.String("o", "out-", "出力ファイル名の接頭辞")
+	chunkSize := flag.Int("size", 1500, "1ファイルあたりの最大文字数(目安)")
+	flag.Parse()
+
+	ctx := context.Background()
+	apiKey := os.Getenv("GEMINI_API_KEY") // Google Cloud TTSでも共通で使えます
 	if apiKey == "" {
 		log.Fatal("GEMINI_API_KEY を設定してください")
 	}
 
-	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+	// 2. TTSクライアントの初期化
+	client, err := texttospeech.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer client.Close()
 
-	// 2. モデルの初期化（Gemini 2.0 Flash を推奨）
-	model := client.GenerativeModel("gemini-2.0-flash")
-
-	// 3. テキストファイルの読み込み
-	// input.txt を読み込む前提
-	data, err := os.ReadFile("input.txt")
+	// 3. テキストの読み込みとクレンジング
+	data, err := os.ReadFile(*inputPath)
 	if err != nil {
-		log.Fatal("input.txt が見つかりません:", err)
+		log.Fatal("ファイル読み込みエラー:", err)
 	}
-	text := string(data)
+	cleanedText := cleanAozoraText(string(data))
 
-	// 4. 生成プロンプトの作成
-	// 音声出力を指示するためにシステムプロンプト的な文脈を与えます
-	prompt := []genai.Part{
-		genai.Text("以下のテキストを、通勤中に聞き取りやすい落ち着いたナレーターの声で朗読してください。出力は音声データのみを返してください。"),
-		genai.Text(text),
-	}
+	// 4. テキストを分割
+	chunks := splitText(cleanedText, *chunkSize)
+	fmt.Printf("全 %d 個のセグメントに分割しました。処理を開始します...\n", len(chunks))
 
-	// 5. 音声生成リクエスト
-	// ※注意: 現時点のSDKでは、モデルの設定で response_mime_type を audio/mpeg に指定します
-	model.ResponseMIMEType = "audio/mpeg"
+	// 5. 各チャンクをループして音声合成
+	for i, chunk := range chunks {
+		outputName := fmt.Sprintf("%s%03d.mp3", *outputPrefix, i+1)
+		fmt.Printf("[%d/%d] %s を生成中...\n", i+1, len(chunks), outputName)
 
-	fmt.Println("音声を生成中...（時間がかかる場合があります）")
-	resp, err := model.GenerateContent(ctx, prompt...)
-	if err != nil {
-		log.Fatal("生成エラー:", err)
-	}
+		req := &texttospeechpb.SynthesizeSpeechRequest{
+			Input: &texttospeechpb.SynthesisInput{
+				InputSource: &texttospeechpb.SynthesisInput_Text{Text: chunk},
+			},
+			Voice: &texttospeechpb.VoiceSelectionParams{
+				LanguageCode: "ja-JP",
+				// ボイス ID を指定
+				Name:      "ja-JP-Standard-D",
+				ModelName: "chirp_3_hd",
+			},
+			AudioConfig: &texttospeechpb.AudioConfig{
+				AudioEncoding: texttospeechpb.AudioEncoding_MP3,
+				SpeakingRate:  1.1,
+			},
+		}
 
-	// 6. 結果をファイルに保存
-	if len(resp.Candidates) > 0 {
-		for _, part := range resp.Candidates[0].Content.Parts {
-			if blob, ok := part.(genai.Blob); ok {
-				err := os.WriteFile("output.mp3", blob.Data, 0644)
-				if err != nil {
-					log.Fatal("ファイル保存エラー:", err)
-				}
-				fmt.Println("完了！ output.mp3 を作成しました。")
-				return
+		var resp *texttospeechpb.SynthesizeSpeechResponse
+		for attempt := 1; attempt <= 3; attempt++ {
+			resp, err = client.SynthesizeSpeech(ctx, req)
+			if err == nil {
+				break
 			}
+			log.Printf("セグメント %d の合成に失敗しました (試行 %d/3): %v", i+1, attempt, err)
+		}
+		if err != nil {
+			log.Printf("セグメント %d の合成を3回試行しましたが失敗しました。スキップします。", i+1)
+			continue
+		}
+
+		if err := os.WriteFile(outputName, resp.AudioContent, 0644); err != nil {
+			log.Fatal("保存失敗:", err)
 		}
 	}
-	fmt.Println("音声データが取得できませんでした。")
+
+	fmt.Println("すべての処理が完了しました。")
+}
+
+// 青空文庫のクレンジング
+func cleanAozoraText(input string) string {
+	reRuby := regexp.MustCompile(`《.*?》`)
+	reRubyStart := regexp.MustCompile(`｜`)
+	reNotes := regexp.MustCompile(`［＃.*?］`)
+	s := reNotes.ReplaceAllString(input, "")
+	s = reRuby.ReplaceAllString(s, "")
+	s = reRubyStart.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
+
+// テキストを適切な長さで分割
+func splitText(text string, targetSize int) []string {
+	var chunks []string
+	runes := []rune(text)
+	totalLen := len(runes)
+	start := 0
+
+	for start < totalLen {
+		end := start + targetSize
+		if end >= totalLen {
+			chunks = append(chunks, string(runes[start:]))
+			break
+		}
+
+		// 区切りのいい改行を探す
+		foundNewline := false
+		for i := end; i < totalLen && i < end+500; i++ {
+			if runes[i] == '\n' {
+				end = i + 1
+				foundNewline = true
+				break
+			}
+		}
+
+		if !foundNewline {
+			end = start + targetSize
+		}
+
+		chunks = append(chunks, string(runes[start:end]))
+		start = end
+	}
+	return chunks
 }
