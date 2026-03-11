@@ -77,8 +77,7 @@ func main() {
 			log.Printf("セグメント %d の合成に失敗しました (試行 %d/3): %v", i+1, attempt, err)
 		}
 		if err != nil {
-			log.Printf("セグメント %d の合成を3回試行しましたが失敗しました。スキップします。", i+1)
-			continue
+			log.Fatalf("セグメント %d の合成を3回試行しましたが失敗しました。中断します", i+1)
 		}
 
 		if err := os.WriteFile(outputName, resp.AudioContent, 0644); err != nil {
