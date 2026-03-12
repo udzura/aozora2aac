@@ -74,6 +74,9 @@ func main() {
 			if err == nil {
 				break
 			}
+			if strings.Contains(err.Error(), "InvalidArgument") {
+				log.Fatalf("セグメント %d の合成に失敗しました。文字数が多すぎたようです (試行 %d/3): %v", i+1, attempt, err)
+			}
 			log.Printf("セグメント %d の合成に失敗しました (試行 %d/3): %v", i+1, attempt, err)
 		}
 		if err != nil {
